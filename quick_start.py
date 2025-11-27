@@ -28,7 +28,8 @@ class Config:
     PASSWORD = os.getenv('EDUCATIVE_PASSWORD', '')
     OUTPUT_DIR = Path('output')
     COOKIES_FILE = OUTPUT_DIR / 'cookies.json'
-    MAX_WORKERS = 5  # Parallel downloads
+    MAX_WORKERS = 10  # Parallel downloads
+    MAX_RETRIES = 5  # Retry attempts for failed downloads
     SCREENSHOT_METHOD = True  # Use screenshots for guaranteed content capture
 
 # Course URL - CHANGE THIS
@@ -206,94 +207,183 @@ class CourseDownloader:
         Captures EVERYTHING visible, no content loss possible
         """
         async with semaphore:
-            context = None
-            page = None
-            try:
-                print(f"[{lesson_num}] 📥 Starting download: {url}")
-                
-                # Use reasonable viewport size (not huge)
-                print(f"[{lesson_num}] 🌐 Creating browser context...")
-                context = await self.browser.new_context(viewport={'width': 1440, 'height': 900})
-                
-                # Use stored cookies (no file I/O)
-                if self.cookies:
-                    await context.add_cookies(self.cookies)
-                    print(f"[{lesson_num}] 🍪 Cookies loaded")
-                
-                page = await context.new_page()
-                print(f"[{lesson_num}] 🔄 Navigating to page...")
-                await page.goto(url, wait_until='domcontentloaded', timeout=60000)
-                # Wait for images and dynamic content after DOM is ready
-                await page.wait_for_load_state('load')
-                await page.wait_for_timeout(2000)  # Additional time for lazy-loaded content
-                print(f"[{lesson_num}] ✓ Page loaded")
-                
-                # Wait for all images
-                print(f"[{lesson_num}] 🖼️  Waiting for images...")
-                await page.evaluate("""
-                    () => Promise.all(Array.from(document.images)
-                        .filter(img => !img.complete)
-                        .map(img => new Promise(r => { img.onload = img.onerror = r; })))
-                """)
-                
-                # Multiple scrolls to trigger ALL lazy-loading
-                print(f"[{lesson_num}] 📜 Scrolling to load lazy content...")
-                total_height = await page.evaluate("document.body.scrollHeight")
-                viewport_height = await page.evaluate("window.innerHeight")
-                
-                for scroll_pos in range(0, total_height, viewport_height // 2):
-                    await page.evaluate(f"window.scrollTo(0, {scroll_pos})")
-                    await page.wait_for_timeout(500)
-                
-                await page.evaluate("window.scrollTo(0, 0)")
-                await page.wait_for_timeout(1000)
-                print(f"[{lesson_num}] ✓ Content loaded")
-                
-                # Get title and create lesson folder
-                title = await page.title()
-                title = self._sanitize_filename(title.split('|')[0].strip())
-                lesson_folder = self.course_dir / f"{lesson_num:03d}_{title}"
-                lesson_folder.mkdir(parents=True, exist_ok=True)
-                
-                # Take full-page screenshot
-                print(f"[{lesson_num}] 📸 Taking screenshot...")
-                screenshot_path = lesson_folder / "page_full.png"
-                await page.screenshot(path=str(screenshot_path), full_page=True)
-                print(f"[{lesson_num}] ✓ Screenshot saved ({screenshot_path.stat().st_size // 1024} KB)")
-                
-                # Convert screenshot to PDF
-                print(f"[{lesson_num}] 📄 Converting to PDF...")
-                pdf_path = lesson_folder / f"{title}.pdf"
-                with open(pdf_path, 'wb') as f:
-                    f.write(img2pdf.convert(str(screenshot_path)))
-                
-                # Clean up screenshot
-                screenshot_path.unlink()
-                
-                pdf_size_kb = pdf_path.stat().st_size // 1024
-                print(f"✅ [{lesson_num}] {title}.pdf ({pdf_size_kb} KB)")
-                print(f"    └─ {pdf_path}")
-                
-                await context.close()
-                return pdf_path
-                
-            except Exception as e:
-                error_msg = str(e)
-                print(f"❌ [{lesson_num}] FAILED: {error_msg}")
-                print(f"    └─ URL: {url}")
-                
-                # Try to save a debug screenshot
+            # Retry logic
+            for attempt in range(1, Config.MAX_RETRIES + 1):
+                context = None
+                page = None
                 try:
-                    if page:
-                        debug_path = self.course_dir / f"error_lesson_{lesson_num}.png"
-                        await page.screenshot(path=str(debug_path))
-                        print(f"    └─ Debug screenshot saved: {debug_path}")
-                except:
-                    pass
-                
-                if context:
+                    if attempt > 1:
+                        print(f"[{lesson_num}] � Retry attempt {attempt}/{Config.MAX_RETRIES}")
+                    else:
+                        print(f"[{lesson_num}] �📥 Starting download: {url}")
+                    
+                    # Use reasonable viewport size (not huge)
+                    if attempt == 1:
+                        print(f"[{lesson_num}] 🌐 Creating browser context...")
+                    context = await self.browser.new_context(viewport={'width': 1440, 'height': 900})
+                    
+                    # Use stored cookies (no file I/O)
+                    if self.cookies:
+                        await context.add_cookies(self.cookies)
+                        if attempt == 1:
+                            print(f"[{lesson_num}] 🍪 Cookies loaded")
+                    
+                    page = await context.new_page()
+                    if attempt == 1:
+                        print(f"[{lesson_num}] 🔄 Navigating to page...")
+                    await page.goto(url, wait_until='domcontentloaded', timeout=100000)  # 100s
+                    
+                    # Wait for page to be fully loaded with all resources
+                    print(f"[{lesson_num}] ⏳ Waiting for page and resources to load...")
+                    await page.wait_for_load_state('load', timeout=100000)  # 100s
+                    
+                    # Try to wait for networkidle, but don't fail if it times out
+                    try:
+                        await page.wait_for_load_state('networkidle', timeout=60000)  # 1 minute
+                    except:
+                        print(f"[{lesson_num}] ⚠️  Network still active (this is OK)")
+                    
+                    await page.wait_for_timeout(3000)  # Extra 3s for dynamic content
+                    print(f"[{lesson_num}] ✓ Page loaded")
+                    
+                    # Wait for all images with extended timeout
+                    print(f"[{lesson_num}] 🖼️  Waiting for images to load...")
+                    try:
+                        await page.evaluate("""
+                            async () => {
+                                // Wait for all images to load
+                                const images = Array.from(document.images);
+                                await Promise.all(
+                                    images.map(img => {
+                                        if (img.complete) return Promise.resolve();
+                                        return new Promise((resolve) => {
+                                            img.onload = resolve;
+                                            img.onerror = resolve;
+                                            // Timeout after 10s per image
+                                            setTimeout(resolve, 10000);
+                                        });
+                                    })
+                                );
+                            }
+                        """)
+                        await page.wait_for_timeout(2000)  # Extra 2s buffer
+                        print(f"[{lesson_num}] ✓ Images loaded")
+                    except Exception as e:
+                        print(f"[{lesson_num}] ⚠️  Image loading timeout (continuing anyway): {e}")
+                    
+                    # Multiple scrolls to trigger ALL lazy-loading with longer waits
+                    print(f"[{lesson_num}] 📜 Scrolling to trigger lazy-loaded content...")
+                    total_height = await page.evaluate("document.body.scrollHeight")
+                    viewport_height = await page.evaluate("window.innerHeight")
+                    
+                    # Scroll more slowly with longer pauses to trigger lazy loading
+                    scroll_step = viewport_height // 3  # Smaller steps
+                    for scroll_pos in range(0, total_height, scroll_step):
+                        await page.evaluate(f"window.scrollTo(0, {scroll_pos})")
+                        await page.wait_for_timeout(1000)  # Increased from 500ms to 1s
+                    
+                    # Scroll back to top
+                    await page.evaluate("window.scrollTo(0, 0)")
+                    await page.wait_for_timeout(2000)
+                    
+                    # Final wait for any remaining lazy-loaded images
+                    print(f"[{lesson_num}] ⏳ Final wait for lazy-loaded media...")
+                    await page.wait_for_timeout(3000)  # Extended final wait
+                    print(f"[{lesson_num}] ✓ Content fully loaded")
+                    
+                    # Hide minimap if present (to avoid covering content)
+                    try:
+                        print(f"[{lesson_num}] 🗺️  Checking for minimap...")
+                        # Try to find and click the minimap button/toggle
+                        minimap_hidden = await page.evaluate("""
+                            () => {
+                                // Look for common minimap selectors
+                                const selectors = [
+                                    '[aria-label*="minimap" i]',
+                                    '[title*="minimap" i]',
+                                    'button[class*="minimap" i]',
+                                    '.minimap-toggle',
+                                    '[data-testid*="minimap" i]'
+                                ];
+                                
+                                for (const selector of selectors) {
+                                    const btn = document.querySelector(selector);
+                                    if (btn) {
+                                        btn.click();
+                                        return true;
+                                    }
+                                }
+                                return false;
+                            }
+                        """)
+                        if minimap_hidden:
+                            print(f"[{lesson_num}] ✓ Minimap hidden")
+                            await page.wait_for_timeout(500)  # Wait for UI to update
+                    except:
+                        pass  # Minimap not found or already hidden
+                    
+                    # Get title and create lesson folder
+                    title = await page.title()
+                    title = self._sanitize_filename(title.split('|')[0].strip())
+                    lesson_folder = self.course_dir / f"{lesson_num:03d}_{title}"
+                    lesson_folder.mkdir(parents=True, exist_ok=True)
+                    
+                    # Take full-page screenshot with increased timeout
+                    print(f"[{lesson_num}] 📸 Taking screenshot...")
+                    screenshot_path = lesson_folder / "page_full.png"
+                    await page.screenshot(path=str(screenshot_path), full_page=True, timeout=60000)  # 60s timeout
+                    print(f"[{lesson_num}] ✓ Screenshot saved ({screenshot_path.stat().st_size // 1024} KB)")
+                    
+                    # Convert screenshot to PDF
+                    print(f"[{lesson_num}] 📄 Converting to PDF...")
+                    pdf_path = lesson_folder / f"{title}.pdf"
+                    with open(pdf_path, 'wb') as f:
+                        f.write(img2pdf.convert(str(screenshot_path)))
+                    
+                    # Clean up screenshot
+                    screenshot_path.unlink()
+                    
+                    pdf_size_kb = pdf_path.stat().st_size // 1024
+                    print(f"✅ [{lesson_num}] {title}.pdf ({pdf_size_kb} KB)")
+                    print(f"    └─ {pdf_path}")
+                    
                     await context.close()
-                return None
+                    return pdf_path
+                    
+                except Exception as e:
+                    error_msg = str(e)
+                    
+                    # Clean up resources
+                    if context:
+                        try:
+                            await context.close()
+                        except:
+                            pass
+                    
+                    # If this is not the last attempt, wait and retry
+                    if attempt < Config.MAX_RETRIES:
+                        wait_time = attempt * 2  # Exponential backoff: 2s, 4s, 6s
+                        print(f"⚠️  [{lesson_num}] Attempt {attempt} failed: {error_msg}")
+                        print(f"    └─ Waiting {wait_time}s before retry...")
+                        await asyncio.sleep(wait_time)
+                        continue
+                    
+                    # Final failure after all retries
+                    print(f"❌ [{lesson_num}] FAILED after {Config.MAX_RETRIES} attempts: {error_msg}")
+                    print(f"    └─ URL: {url}")
+                    
+                    # Try to save a debug screenshot
+                    try:
+                        if page:
+                            debug_path = self.course_dir / f"error_lesson_{lesson_num}.png"
+                            await page.screenshot(path=str(debug_path))
+                            print(f"    └─ Debug screenshot saved: {debug_path}")
+                    except:
+                        pass
+                    
+                    return None
+            
+            return None  # Should never reach here
     
     async def download_lesson_as_pdf_enhanced(self, url: str, lesson_num: int, semaphore: asyncio.Semaphore) -> Optional[Path]:
         """
