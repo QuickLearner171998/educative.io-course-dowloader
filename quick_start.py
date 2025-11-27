@@ -44,6 +44,7 @@ class CourseDownloader:
         self.course_dir = Config.OUTPUT_DIR / self.course_name
         self.browser: Optional[Browser] = None
         self.lesson_urls: List[str] = []
+        self.cookies: Optional[List] = None  # Store cookies for reuse
         
     def _extract_course_name(self, url: str) -> str:
         """Extract course name from URL"""
@@ -61,59 +62,69 @@ class CourseDownloader:
         try:
             print("🔐 Authenticating...")
             
-            # Try saved cookies
+            # Try saved cookies - load BEFORE navigation
             if Config.COOKIES_FILE.exists():
-                with open(Config.COOKIES_FILE, 'r') as f:
-                    cookies = json.load(f)
-                await page.context.add_cookies(cookies)
-                await page.goto(self.course_url)
-                await page.wait_for_load_state('networkidle')
-                
-                if await page.evaluate("() => document.cookie.includes('logged_in')"):
-                    print("✓ Using saved session")
-                    return True
+                print("Found saved cookies, attempting auto-login...")
+                try:
+                    with open(Config.COOKIES_FILE, 'r') as f:
+                        cookies = json.load(f)
+                    
+                    # Load cookies into context FIRST
+                    await page.context.add_cookies(cookies)
+                    
+                    # THEN navigate to course URL
+                    await page.goto(self.course_url, timeout=90000, wait_until='domcontentloaded')
+                    await page.wait_for_timeout(3000)
+                    
+                    # Check if authentication was successful
+                    if await page.evaluate("() => document.cookie.includes('logged_in')"):
+                        print("✓ Using saved session")
+                        self.cookies = cookies  # Store for parallel downloads
+                        return True
+                    else:
+                        print("⚠️ Saved cookies are invalid or expired")
+                except Exception as e:
+                    print(f"⚠️ Error loading cookies: {e}")
+                    print("Proceeding to manual login...")
             
             # Manual/auto login
             print("Opening login page...")
-            await page.goto('https://www.educative.io/login')
-            await page.wait_for_load_state('networkidle')
+            try:
+                await page.goto('https://www.educative.io/login', timeout=90000, wait_until='domcontentloaded')
+                print("✓ Page loaded")
+                await page.wait_for_timeout(3000)
+                print("✓ Login page ready")
+            except Exception as e:
+                print(f"⚠️ Page load issue: {e}")
+                print("Continuing anyway...")
+                await page.wait_for_timeout(3000)
             
-            if Config.EMAIL and Config.PASSWORD:
-                print("Auto-filling credentials...")
-                try:
-                    # Click "Continue with Email" button if present
-                    email_button = page.locator('text=Continue with Email')
-                    if await email_button.count() > 0:
-                        print("Clicking 'Continue with Email'...")
-                        await email_button.click()
-                        await page.wait_for_timeout(1000)
-                    
-                    # Fill email and password
-                    await page.fill('input[type="email"], input[name="email"]', Config.EMAIL)
-                    await page.wait_for_timeout(500)
-                    await page.fill('input[type="password"], input[name="password"]', Config.PASSWORD)
-                    await page.wait_for_timeout(500)
-                    
-                    # Click submit/login button
-                    await page.click('button[type="submit"], button:has-text("Log in"), button:has-text("Sign in")')
-                    print("⏳ Enter OTP (120s)...")
-                    await page.wait_for_timeout(120000)
-                except Exception as e:
-                    print(f"⚠️ Auto-fill failed: {e}")
-                    print("⏳ Manual login (180s)...")
-                    await page.wait_for_timeout(180000)
-            else:
-                print("⏳ Manual login (180s)...")
-                await page.wait_for_timeout(180000)
+            # Manual login only
+            print("\n" + "="*70)
+            print("⏳ PLEASE COMPLETE THE LOGIN MANUALLY")
+            print("   1. Click 'Continue with Email'")
+            print("   2. Enter your email and password")  
+            print("   3. Complete OTP if required")
+            print("   You have 50 seconds...")
+            print("="*70 + "\n")
+            await page.wait_for_timeout(50000)
             
             # Verify and save
-            await page.goto(self.course_url)
+            print("Verifying login...")
+            try:
+                await page.goto(self.course_url, timeout=90000, wait_until='domcontentloaded')
+                await page.wait_for_timeout(3000)
+            except Exception as e:
+                print(f"⚠️ Navigation to course failed: {e}")
+                return False
+            
             if await page.evaluate("() => document.cookie.includes('logged_in')"):
                 cookies = await page.context.cookies()
                 Config.OUTPUT_DIR.mkdir(exist_ok=True)
                 with open(Config.COOKIES_FILE, 'w') as f:
                     json.dump(cookies, f)
                 print("✓ Authentication successful")
+                self.cookies = cookies  # Store for parallel downloads
                 return True
             
             return False
@@ -128,19 +139,62 @@ class CourseDownloader:
             await page.goto(self.course_url)
             await page.wait_for_load_state('networkidle')
             
+            # Click on "Content" tab if it exists (to show TOC)
+            try:
+                print("   🔍  Looking for Content tab...")
+                content_btn = await page.wait_for_selector('text=Content', timeout=5000)
+                if content_btn:
+                    await content_btn.click()
+                    await page.wait_for_timeout(1000)
+                    print("   ✓ Clicked Content tab")
+            except:
+                print("   ℹ️  Content tab not found, continuing...")
+            
+            # Click "Expand All" to reveal all sub-lessons
+            try:
+                print("   🔍 Looking for Expand All button...")
+                expand_btn = await page.wait_for_selector('text=Expand All', timeout=5000)
+                if expand_btn:
+                    await expand_btn.click()
+                    await page.wait_for_timeout(2000)  # Wait for all chapters to expand
+                    print("   ✓ Expanded all chapters")
+            except Exception as e:
+                print(f"   ⚠️  Could not click Expand All: {e}")
+                print("   Continuing anyway...")
+            
+            # Extract all lesson links using the specific class for lessons
+            print("   🔍 Extracting lesson URLs...")
             links = await page.evaluate("""
                 () => {
-                    const links = Array.from(document.querySelectorAll('a[href*="/courses/"]'));
-                    const base = window.location.pathname;
-                    return links
-                        .map(a => a.href)
-                        .filter(href => href.includes(base) && href !== window.location.href)
-                        .filter((v, i, a) => a.indexOf(v) === i);
+                    // Get all lesson links (including sub-lessons)
+                    const lessonLinks = Array.from(document.querySelectorAll('a.Lesson_lesson__uSC7b'));
+                    
+                    // Extract unique URLs
+                    const urls = [...new Set(lessonLinks.map(a => a.href))];
+                    
+                    // Filter to only include actual lesson pages (not the main course page)
+                    const coursePath = window.location.pathname;
+                    return urls.filter(url => 
+                        url.includes(coursePath) && 
+                        url !== window.location.href &&
+                        !url.endsWith(coursePath) &&
+                        !url.endsWith(coursePath + '/')
+                    );
                 }
             """)
             
             self.lesson_urls = links
-            print(f"✓ Found {len(links)} lessons")
+            print(f"✓ Found {len(links)} lessons (including sub-lessons)")
+            
+            # Show first few for verification
+            if links:
+                print(f"\n   📝 First few lessons:")
+                for url in links[:3]:
+                    lesson_name = url.split('/')[-1].replace('-', ' ').title()
+                    print(f"      • {lesson_name}")
+                if len(links) > 3:
+                    print(f"      ... and {len(links) - 3} more\n")
+            
             return links
         except Exception as e:
             print(f"❌ URL extraction failed: {e}")
@@ -153,19 +207,29 @@ class CourseDownloader:
         """
         async with semaphore:
             context = None
+            page = None
             try:
-                print(f"[{lesson_num}] Downloading (screenshot method): {url}")
+                print(f"[{lesson_num}] 📥 Starting download: {url}")
                 
                 # Use reasonable viewport size (not huge)
+                print(f"[{lesson_num}] 🌐 Creating browser context...")
                 context = await self.browser.new_context(viewport={'width': 1440, 'height': 900})
-                if Config.COOKIES_FILE.exists():
-                    with open(Config.COOKIES_FILE, 'r') as f:
-                        await context.add_cookies(json.load(f))
+                
+                # Use stored cookies (no file I/O)
+                if self.cookies:
+                    await context.add_cookies(self.cookies)
+                    print(f"[{lesson_num}] 🍪 Cookies loaded")
                 
                 page = await context.new_page()
-                await page.goto(url, wait_until='networkidle', timeout=30000)
+                print(f"[{lesson_num}] 🔄 Navigating to page...")
+                await page.goto(url, wait_until='domcontentloaded', timeout=60000)
+                # Wait for images and dynamic content after DOM is ready
+                await page.wait_for_load_state('load')
+                await page.wait_for_timeout(2000)  # Additional time for lazy-loaded content
+                print(f"[{lesson_num}] ✓ Page loaded")
                 
                 # Wait for all images
+                print(f"[{lesson_num}] 🖼️  Waiting for images...")
                 await page.evaluate("""
                     () => Promise.all(Array.from(document.images)
                         .filter(img => !img.complete)
@@ -173,6 +237,7 @@ class CourseDownloader:
                 """)
                 
                 # Multiple scrolls to trigger ALL lazy-loading
+                print(f"[{lesson_num}] 📜 Scrolling to load lazy content...")
                 total_height = await page.evaluate("document.body.scrollHeight")
                 viewport_height = await page.evaluate("window.innerHeight")
                 
@@ -182,6 +247,7 @@ class CourseDownloader:
                 
                 await page.evaluate("window.scrollTo(0, 0)")
                 await page.wait_for_timeout(1000)
+                print(f"[{lesson_num}] ✓ Content loaded")
                 
                 # Get title and create lesson folder
                 title = await page.title()
@@ -190,10 +256,13 @@ class CourseDownloader:
                 lesson_folder.mkdir(parents=True, exist_ok=True)
                 
                 # Take full-page screenshot
+                print(f"[{lesson_num}] 📸 Taking screenshot...")
                 screenshot_path = lesson_folder / "page_full.png"
                 await page.screenshot(path=str(screenshot_path), full_page=True)
+                print(f"[{lesson_num}] ✓ Screenshot saved ({screenshot_path.stat().st_size // 1024} KB)")
                 
                 # Convert screenshot to PDF
+                print(f"[{lesson_num}] 📄 Converting to PDF...")
                 pdf_path = lesson_folder / f"{title}.pdf"
                 with open(pdf_path, 'wb') as f:
                     f.write(img2pdf.convert(str(screenshot_path)))
@@ -201,12 +270,27 @@ class CourseDownloader:
                 # Clean up screenshot
                 screenshot_path.unlink()
                 
-                print(f"✓ [{lesson_num}] {title}.pdf")
+                pdf_size_kb = pdf_path.stat().st_size // 1024
+                print(f"✅ [{lesson_num}] {title}.pdf ({pdf_size_kb} KB)")
+                print(f"    └─ {pdf_path}")
+                
                 await context.close()
                 return pdf_path
                 
             except Exception as e:
-                print(f"✗ [{lesson_num}] Failed: {e}")
+                error_msg = str(e)
+                print(f"❌ [{lesson_num}] FAILED: {error_msg}")
+                print(f"    └─ URL: {url}")
+                
+                # Try to save a debug screenshot
+                try:
+                    if page:
+                        debug_path = self.course_dir / f"error_lesson_{lesson_num}.png"
+                        await page.screenshot(path=str(debug_path))
+                        print(f"    └─ Debug screenshot saved: {debug_path}")
+                except:
+                    pass
+                
                 if context:
                     await context.close()
                 return None
@@ -222,12 +306,16 @@ class CourseDownloader:
                 print(f"[{lesson_num}] Downloading (enhanced PDF): {url}")
                 
                 context = await self.browser.new_context()
-                if Config.COOKIES_FILE.exists():
-                    with open(Config.COOKIES_FILE, 'r') as f:
-                        await context.add_cookies(json.load(f))
+                
+                # Use stored cookies (no file I/O)
+                if self.cookies:
+                    await context.add_cookies(self.cookies)
                 
                 page = await context.new_page()
-                await page.goto(url, wait_until='networkidle', timeout=30000)
+                await page.goto(url, wait_until='domcontentloaded', timeout=60000)
+                # Wait for page to be fully loaded
+                await page.wait_for_load_state('load')
+                await page.wait_for_timeout(2000)
                 
                 # Enhanced content loading
                 await page.evaluate("""

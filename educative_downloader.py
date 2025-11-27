@@ -274,7 +274,7 @@ class AuthenticationHandler:
             logger.error(f"✗ Google login error: {e}")
             return False
     
-    def login_with_otp_support(self, email: str, password: str, otp_timeout: int = 120) -> bool:
+    def login_with_otp_support(self, email: str, password: str, otp_timeout: int = 30) -> bool:
         """Perform login with OTP/2FA support - fills email/password, waits for OTP"""
         try:
             logger.info("=" * 60)
