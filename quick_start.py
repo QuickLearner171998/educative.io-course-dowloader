@@ -32,8 +32,20 @@ class Config:
     MAX_RETRIES = 5  # Retry attempts for failed downloads
     SCREENSHOT_METHOD = True  # Use screenshots for guaranteed content capture
 
-# Course URL - CHANGE THIS
-COURSE_URL = "https://www.educative.io/courses/agentic-ai-systems"
+# Course URLs - CHANGE THIS
+COURSE_URLS = [
+    "https://www.educative.io/courses/n8n",
+    "https://www.educative.io/courses/model-context-protocol",
+    "https://www.educative.io/courses/generative-ai-essentials",
+    "https://www.educative.io/courses/software-architecture-in-applications",
+    "https://www.educative.io/courses/introduction-microservice-principles-concepts",
+    "https://www.educative.io/courses/microservice-architecture-practical-implementation",
+    "https://www.educative.io/courses/software-design-patterns-best-practices",
+    "https://www.educative.io/courses/grokking-the-machine-learning-interview",
+    "https://www.educative.io/courses/generative-ai-handbook",
+    "https://www.educative.io/courses/generative-ai-product-launch"
+
+]
 
 
 class CourseDownloader:
@@ -213,9 +225,9 @@ class CourseDownloader:
                 page = None
                 try:
                     if attempt > 1:
-                        print(f"[{lesson_num}] � Retry attempt {attempt}/{Config.MAX_RETRIES}")
+                        print(f"[{lesson_num}]  Retry attempt {attempt}/{Config.MAX_RETRIES}")
                     else:
-                        print(f"[{lesson_num}] �📥 Starting download: {url}")
+                        print(f"[{lesson_num}] 📥 Starting download: {url}")
                     
                     # Use reasonable viewport size (not huge)
                     if attempt == 1:
@@ -549,34 +561,33 @@ if __name__ == '__main__':
     print("=" * 70)
     print()
     print("🎯 Method: Full-page screenshots → PDF (100% content capture)")
-    print(f"📚 Course: {COURSE_URL}")
-    print(f"📧 Email: {Config.EMAIL}")
+    print(f" Email: {Config.EMAIL}")
     print(f"⚡ Workers: {Config.MAX_WORKERS}")
     print()
-    print("� Output Structure:")
-    print("   output/")
-    print("   └── course-name/")
-    print("       ├── 001_Lesson_Name/")
-    print("       │   └── Lesson_Name.pdf")
-    print("       ├── 002_Next_Lesson/")
-    print("       └── course-name_COMPLETE.pdf")
-    print()
-    print("=" * 70)
-    print()
     
-    downloader = CourseDownloader(COURSE_URL)
-    success = asyncio.run(downloader.run())
+    total_courses = len(COURSE_URLS)
+    print(f"📚 Found {total_courses} courses to download")
     
-    print()
-    if success:
-        print("=" * 70)
-        print("✅ DOWNLOAD COMPLETE!")
-        print("=" * 70)
-        print(f"\n📁 Location: {downloader.course_dir}")
-        print(f"   • Individual lessons in numbered folders")
-        print(f"   • Complete course: {downloader.course_name}_COMPLETE.pdf")
-        print("=" * 70)
-    else:
-        print("=" * 70)
-        print("❌ DOWNLOAD FAILED")
-        print("=" * 70)
+    for i, course_url in enumerate(COURSE_URLS, 1):
+        print("\n" + "="*70)
+        print(f"📦 PROCESSING COURSE {i}/{total_courses}")
+        print(f"🔗 URL: {course_url}")
+        print("="*70 + "\n")
+        
+        downloader = CourseDownloader(course_url)
+        success = asyncio.run(downloader.run())
+        
+        if success:
+            print("\n" + "="*70)
+            print(f"✅ COURSE {i} COMPLETE: {downloader.course_name}")
+            print(f"📁 Location: {downloader.course_dir}")
+            print("="*70)
+        else:
+            print("\n" + "="*70)
+            print(f"❌ COURSE {i} FAILED: {downloader.course_name}")
+            print("="*70)
+            
+    print("\n" + "="*70)
+    print("🎉 ALL DOWNLOADS FINISHED")
+    print("="*70)
+
